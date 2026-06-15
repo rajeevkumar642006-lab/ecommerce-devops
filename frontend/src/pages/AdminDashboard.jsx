@@ -137,7 +137,7 @@ const OverviewTab = () => {
                     <td style={styles.td}>{o.user?.name || '—'}</td>
                     <td style={styles.td}>₹{o.totalPrice.toLocaleString('en-IN')}</td>
                     <td style={styles.td}><StatusBadge status={o.status} /></td>
-                    <td style={styles.td} style={{ color: 'var(--text-muted)', fontSize: '.82rem' }}>
+                    <td style={{ ...styles.td, color: 'var(--text-muted)', fontSize: '.82rem' }}>
                       {new Date(o.createdAt).toLocaleDateString('en-IN')}
                     </td>
                   </tr>
