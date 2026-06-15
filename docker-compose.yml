@@ -1,0 +1,121 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# docker-compose.yml  —  Local development orchestration
+#
+# Services:
+#   mongodb   — MongoDB 7 database with persistent volume
+#   backend   — Node.js + Express REST API
+#   frontend  — React SPA served by Nginx (proxies /api to backend)
+#
+# Usage:
+#   docker compose up --build          # first run
+#   docker compose up -d               # subsequent runs (detached)
+#   docker compose down -v             # stop and remove volumes
+#   docker compose logs -f backend     # tail backend logs
+#
+# Access:
+#   Frontend  →  http://localhost:3000
+#   Backend   →  http://localhost:5001/api/health
+#   MongoDB   →  mongodb://localhost:27017/ecommerce  (host access)
+# ─────────────────────────────────────────────────────────────────────────────
+
+version: "3.9"
+
+# ── Named volumes ─────────────────────────────────────────────────────────────
+volumes:
+  mongo_data:
+    driver: local   # persists MongoDB data across container restarts
+
+# ── Networks ──────────────────────────────────────────────────────────────────
+networks:
+  app_network:
+    driver: bridge  # all three services share this internal network
+
+# ── Services ──────────────────────────────────────────────────────────────────
+services:
+
+  # ── MongoDB ────────────────────────────────────────────────────────────────
+  mongodb:
+    image: mongo:7.0
+    container_name: ecommerce_mongo
+    restart: unless-stopped
+
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: root
+      MONGO_INITDB_ROOT_PASSWORD: rootpassword   # change in production
+      MONGO_INITDB_DATABASE:      ecommerce
+
+    ports:
+      - "27017:27017"   # expose to host for local DB tools (Compass, etc.)
+
+    volumes:
+      - mongo_data:/data/db                          # persist data
+      - ./docker/mongo/init-db.js:/docker-entrypoint-initdb.d/init-db.js:ro
+
+    networks:
+      - app_network
+
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 30s
+      timeout:  10s
+      retries:  5
+      start_period: 20s
+
+  # ── Backend ────────────────────────────────────────────────────────────────
+  backend:
+    build:
+      context:    ./backend
+      dockerfile: Dockerfile
+    container_name: ecommerce_backend
+    restart: unless-stopped
+
+    # Wait for MongoDB to be healthy before starting
+    depends_on:
+      mongodb:
+        condition: service_healthy
+
+    environment:
+      NODE_ENV:             production
+      PORT:                 5001
+      # Use the service name "mongodb" as the hostname inside Docker network
+      MONGO_URI:            mongodb://ecommerceUser:ecommercePass@mongodb:27017/ecommerce
+      JWT_SECRET:           change_this_jwt_secret_in_production_min_32_chars
+      JWT_EXPIRES_IN:       7d
+      CLIENT_ORIGIN:        http://localhost:3000
+      RATE_LIMIT_WINDOW_MS: 900000
+      RATE_LIMIT_MAX:       100
+
+    ports:
+      - "5001:5001"   # expose for direct API testing / Postman
+
+    networks:
+      - app_network
+
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:5001/api/health"]
+      interval: 30s
+      timeout:  10s
+      retries:  5
+      start_period: 20s
+
+  # ── Frontend ───────────────────────────────────────────────────────────────
+  frontend:
+    build:
+      context:    ./frontend
+      dockerfile: Dockerfile
+      args:
+        # The frontend Nginx config proxies /api to the backend container,
+        # so the browser-visible URL is always relative (/api).
+        VITE_API_BASE_URL: /api
+    container_name: ecommerce_frontend
+    restart: unless-stopped
+
+    depends_on:
+      backend:
+        condition: service_healthy
+
+    ports:
+      - "3000:80"   # host:3000 → container:80 (Nginx)
+
+    networks:
+      - app_network

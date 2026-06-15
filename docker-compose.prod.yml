@@ -1,0 +1,50 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# docker-compose.prod.yml  —  Production overrides
+#
+# Usage (merge with base file):
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+#
+# Differences from development:
+#   • Uses pre-built images from a registry instead of building locally
+#   • Removes host port exposure for MongoDB (not accessible from outside)
+#   • Adds resource limits
+#   • Reads secrets from environment variables (set by CI/CD or .env.prod)
+# ─────────────────────────────────────────────────────────────────────────────
+
+version: "3.9"
+
+services:
+
+  mongodb:
+    image: mongo:7.0
+    ports: []   # do NOT expose MongoDB to the host in production
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USER}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD}
+      MONGO_INITDB_DATABASE:      ecommerce
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  backend:
+    image: ${REGISTRY}/ecommerce-backend:${IMAGE_TAG:-latest}
+    build: {}   # disable local build — use registry image
+    environment:
+      NODE_ENV:   production
+      MONGO_URI:  mongodb://${MONGO_APP_USER}:${MONGO_APP_PASS}@mongodb:27017/ecommerce
+      JWT_SECRET: ${JWT_SECRET}
+      CLIENT_ORIGIN: ${CLIENT_ORIGIN}
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          memory: 256M
+
+  frontend:
+    image: ${REGISTRY}/ecommerce-frontend:${IMAGE_TAG:-latest}
+    build: {}   # disable local build — use registry image
+    deploy:
+      resources:
+        limits:
+          memory: 64M

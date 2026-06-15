@@ -1,0 +1,239 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// Jenkinsfile  —  Declarative CI/CD pipeline for ecommerce-devops
+//
+// Pipeline stages:
+//   1. Checkout          — clone the repository
+//   2. Install Backend   — npm ci for the Express API
+//   3. Test Backend      — run Jest integration tests
+//   4. Install Frontend  — npm ci for the React app
+//   5. Build Frontend    — vite build → static dist/
+//   6. Build Images      — docker build for backend and frontend
+//   7. Push Images       — push to Docker registry (main branch only)
+//   8. Deploy            — docker compose up on the target server
+//   9. Verify            — health-check the deployed API
+//
+// Prerequisites on the Jenkins agent:
+//   • Node.js 20 (via NodeJS plugin or PATH)
+//   • Docker + Docker Compose v2
+//   • Credentials:
+//       DOCKER_CREDENTIALS_ID  — Docker Hub / registry username+password
+//       SSH_DEPLOY_KEY          — SSH private key for the deploy server
+//
+// Environment variables (configure in Jenkins → Manage → System):
+//   DOCKER_REGISTRY   e.g. docker.io/youruser
+//   DEPLOY_HOST       e.g. ubuntu@192.168.1.100
+//   DEPLOY_PATH       e.g. /opt/ecommerce-devops
+// ─────────────────────────────────────────────────────────────────────────────
+
+pipeline {
+
+    // Run on any available agent; replace 'any' with a label for a specific node
+    agent any
+
+    // ── Tool versions ─────────────────────────────────────────────────────────
+    tools {
+        nodejs 'NodeJS-20'   // must match the name in Jenkins → Global Tool Config
+    }
+
+    // ── Pipeline-wide environment ─────────────────────────────────────────────
+    environment {
+        // Image names — tag with the short Git commit SHA for traceability
+        IMAGE_TAG        = "${env.GIT_COMMIT?.take(8) ?: 'latest'}"
+        BACKEND_IMAGE    = "${env.DOCKER_REGISTRY ?: 'ecommerce'}/ecommerce-backend:${IMAGE_TAG}"
+        FRONTEND_IMAGE   = "${env.DOCKER_REGISTRY ?: 'ecommerce'}/ecommerce-frontend:${IMAGE_TAG}"
+
+        // Node.js memory limit for the build agent
+        NODE_OPTIONS     = '--max-old-space-size=1024'
+    }
+
+    // ── Build options ─────────────────────────────────────────────────────────
+    options {
+        timeout(time: 30, unit: 'MINUTES')   // abort if the pipeline hangs
+        disableConcurrentBuilds()            // prevent parallel runs on same branch
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+    }
+
+    // ── Stages ────────────────────────────────────────────────────────────────
+    stages {
+
+        // ── 1. Checkout ───────────────────────────────────────────────────────
+        stage('Checkout') {
+            steps {
+                echo "Checking out branch: ${env.BRANCH_NAME}"
+                checkout scm
+                sh 'git log --oneline -5'   // show recent commits in the log
+            }
+        }
+
+        // ── 2. Install Backend Dependencies ───────────────────────────────────
+        stage('Install Backend') {
+            steps {
+                dir('backend') {
+                    echo 'Installing backend dependencies…'
+                    sh 'npm ci'
+                    sh 'node --version && npm --version'
+                }
+            }
+        }
+
+        // ── 3. Run Backend Tests ──────────────────────────────────────────────
+        stage('Test Backend') {
+            environment {
+                // Provide minimal env vars so tests can load config/env.js
+                MONGO_URI  = 'mongodb://localhost/test_ci'
+                JWT_SECRET = 'ci_test_secret_key_minimum_32_chars_long'
+                NODE_ENV   = 'test'
+            }
+            steps {
+                dir('backend') {
+                    echo 'Running backend tests…'
+                    sh 'npm test -- --forceExit --passWithNoTests'
+                }
+            }
+            post {
+                always {
+                    // Publish JUnit-compatible test results if jest-junit is configured
+                    junit allowEmptyResults: true, testResults: 'backend/test-results/**/*.xml'
+                }
+            }
+        }
+
+        // ── 4. Install Frontend Dependencies ─────────────────────────────────
+        stage('Install Frontend') {
+            steps {
+                dir('frontend') {
+                    echo 'Installing frontend dependencies…'
+                    sh 'npm ci'
+                }
+            }
+        }
+
+        // ── 5. Build Frontend ─────────────────────────────────────────────────
+        stage('Build Frontend') {
+            environment {
+                // In CI the frontend proxies /api via Nginx, so use relative path
+                VITE_API_BASE_URL = '/api'
+            }
+            steps {
+                dir('frontend') {
+                    echo 'Building React application…'
+                    sh 'npm run build'
+                    sh 'ls -lh dist/'
+                }
+            }
+        }
+
+        // ── 6. Build Docker Images ────────────────────────────────────────────
+        stage('Build Docker Images') {
+            steps {
+                echo "Building Docker images with tag: ${IMAGE_TAG}"
+                sh """
+                    docker build \
+                        -t ${BACKEND_IMAGE} \
+                        -t ecommerce/ecommerce-backend:latest \
+                        ./backend
+                """
+                sh """
+                    docker build \
+                        --build-arg VITE_API_BASE_URL=/api \
+                        -t ${FRONTEND_IMAGE} \
+                        -t ecommerce/ecommerce-frontend:latest \
+                        ./frontend
+                """
+                sh 'docker images | grep ecommerce'
+            }
+        }
+
+        // ── 7. Push to Registry (main / master branch only) ───────────────────
+        stage('Push Docker Images') {
+            when {
+                anyOf {
+                    branch 'main'
+                    branch 'master'
+                }
+            }
+            steps {
+                withCredentials([usernamePassword(
+                    credentialsId: 'DOCKER_CREDENTIALS_ID',
+                    usernameVariable: 'DOCKER_USER',
+                    passwordVariable: 'DOCKER_PASS'
+                )]) {
+                    sh 'echo "$DOCKER_PASS" | docker login -u "$DOCKER_USER" --password-stdin'
+                    sh "docker push ${BACKEND_IMAGE}"
+                    sh "docker push ${FRONTEND_IMAGE}"
+                    sh 'docker logout'
+                }
+            }
+        }
+
+        // ── 8. Deploy ─────────────────────────────────────────────────────────
+        stage('Deploy') {
+            when {
+                anyOf {
+                    branch 'main'
+                    branch 'master'
+                }
+            }
+            steps {
+                withCredentials([sshUserPrivateKey(
+                    credentialsId: 'SSH_DEPLOY_KEY',
+                    keyFileVariable: 'SSH_KEY'
+                )]) {
+                    sh """
+                        ssh -i $SSH_KEY \
+                            -o StrictHostKeyChecking=no \
+                            ${env.DEPLOY_HOST ?: 'deploy@localhost'} \
+                            "
+                            cd ${env.DEPLOY_PATH ?: '/opt/ecommerce-devops'} &&
+                            git pull origin main &&
+                            IMAGE_TAG=${IMAGE_TAG} docker compose \
+                                -f docker-compose.yml \
+                                -f docker-compose.prod.yml \
+                                up -d --remove-orphans
+                            "
+                    """
+                }
+            }
+        }
+
+        // ── 9. Verify Deployment ──────────────────────────────────────────────
+        stage('Verify') {
+            when {
+                anyOf {
+                    branch 'main'
+                    branch 'master'
+                }
+            }
+            steps {
+                script {
+                    def deployHost = env.DEPLOY_HOST_URL ?: 'http://localhost:5000'
+                    echo "Verifying deployment at ${deployHost}/api/health"
+
+                    // Retry up to 5 times with 10-second intervals
+                    retry(5) {
+                        sleep(time: 10, unit: 'SECONDS')
+                        sh "curl -sf ${deployHost}/api/health | grep '\"success\":true'"
+                    }
+                    echo 'Deployment verified successfully!'
+                }
+            }
+        }
+    }
+
+    // ── Post-pipeline actions ─────────────────────────────────────────────────
+    post {
+        success {
+            echo "Pipeline succeeded for branch ${env.BRANCH_NAME} — image tag: ${IMAGE_TAG}"
+        }
+        failure {
+            echo "Pipeline FAILED for branch ${env.BRANCH_NAME}. Check the logs above."
+            // Add email/Slack notification here:
+            // mail to: 'team@example.com', subject: "Build failed: ${env.JOB_NAME}"
+        }
+        always {
+            // Clean up dangling Docker images to save disk space on the agent
+            sh 'docker image prune -f || true'
+            cleanWs()   // remove workspace files
+        }
+    }
+}
