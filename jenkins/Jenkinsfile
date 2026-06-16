@@ -37,8 +37,9 @@ pipeline {
 
     // ── Pipeline-wide environment ─────────────────────────────────────────────
     environment {
-        // Prepend Git Bash bin directories to PATH so Jenkins can find 'sh' on Windows agents
+        // Prepend Git Bash bin directories to PATH/Path so Jenkins can find 'sh' on Windows agents
         PATH             = "C:\\Program Files\\Git\\bin;C:\\Program Files\\Git\\usr\\bin;${env.PATH}"
+        Path             = "C:\\Program Files\\Git\\bin;C:\\Program Files\\Git\\usr\\bin;${env.Path}"
 
         // Image names — tag with the short Git commit SHA for traceability
         IMAGE_TAG        = "${env.GIT_COMMIT?.take(8) ?: 'latest'}"
